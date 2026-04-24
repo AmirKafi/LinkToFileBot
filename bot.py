@@ -2,7 +2,6 @@ import os
 import logging
 import uuid
 import requests
-import re
 
 from telegram import Update
 from telegram.ext import (
@@ -12,6 +11,8 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
+
+from playwright.sync_api import sync_playwright
 
 # ------------------ LOGGING ------------------
 logging.basicConfig(level=logging.INFO)
@@ -23,53 +24,66 @@ if not TOKEN:
 
 # ------------------ HELPERS ------------------
 def is_url(text: str):
-    return bool(re.match(r"https?://", text))
+    return text.startswith("http://") or text.startswith("https://")
 
 
-def download_file(url: str, path: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*"
-    }
+def download_requests(url, path):
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     with requests.get(url, stream=True, headers=headers, timeout=60) as r:
         r.raise_for_status()
 
-        # If response is HTML, it's probably blocked
-        content_type = r.headers.get("Content-Type", "")
-        if "text/html" in content_type:
-            raise Exception("Blocked or not a direct file")
+        ctype = r.headers.get("Content-Type", "")
+        if "text/html" in ctype:
+            raise Exception("Blocked or HTML response")
 
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
 
+
+def download_playwright(url, path):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        response = page.goto(url, wait_until="networkidle", timeout=60000)
+
+        if not response:
+            browser.close()
+            raise Exception("No response from browser")
+
+        content = response.body()
+
+        with open(path, "wb") as f:
+            f.write(content)
+
+        browser.close()
+
 # ------------------ COMMANDS ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Universal Downloader Bot is online.\n\n"
-        "Send any direct download link."
+        "Universal Downloader is online.\n\n"
+        "Send any download link."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Supported:\n"
-        "- Direct file links\n"
-        "- Most CDN links\n\n"
-        "May NOT work:\n"
-        "- Google Drive preview\n"
-        "- Mega links\n"
-        "- Strong anti-bot sites\n"
+        "How it works:\n"
+        "1. Send a URL\n"
+        "2. Bot tries direct download\n"
+        "3. If blocked → browser fallback\n\n"
+        "Works best with direct file links and Gofile."
     )
 
-# ------------------ MAIN HANDLER ------------------
+# ------------------ HANDLER ------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        text = update.message.text
+        url = update.message.text
 
-        if not text or not is_url(text):
+        if not url or not is_url(url):
             await update.message.reply_text("Send a valid URL.")
             return
 
@@ -78,24 +92,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = str(uuid.uuid4())
         file_path = f"/tmp/{file_id}"
 
+        # Step 1: try requests
         try:
-            download_file(text, file_path)
+            download_requests(url, file_path)
         except Exception as e:
-            logger.warning(f"Direct download failed: {e}")
-            await update.message.reply_text("Trying alternative method...")
+            logger.warning(f"Requests failed: {e}")
+            await update.message.reply_text("Trying browser mode...")
 
-            # fallback: simple retry with stronger headers
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                "Referer": text
-            }
-
-            with requests.get(text, stream=True, headers=headers, timeout=60) as r:
-                r.raise_for_status()
-                with open(file_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
+            # Step 2: fallback to browser
+            download_playwright(url, file_path)
 
         await update.message.reply_text("Uploading...")
 
@@ -119,6 +124,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
