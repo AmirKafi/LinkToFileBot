@@ -2,6 +2,7 @@ import os
 import logging
 import uuid
 import requests
+import re
 
 from telegram import Update
 from telegram.ext import (
@@ -13,57 +14,88 @@ from telegram.ext import (
 )
 
 # ------------------ LOGGING ------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ------------------ ENV ------------------
 TOKEN = os.getenv("BOT_TOKEN")
-
 if not TOKEN:
-    raise Exception("BOT_TOKEN is missing")
+    raise Exception("BOT_TOKEN missing")
+
+# ------------------ HELPERS ------------------
+def is_url(text: str):
+    return bool(re.match(r"https?://", text))
+
+
+def download_file(url: str, path: str):
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*"
+    }
+
+    with requests.get(url, stream=True, headers=headers, timeout=60) as r:
+        r.raise_for_status()
+
+        # If response is HTML, it's probably blocked
+        content_type = r.headers.get("Content-Type", "")
+        if "text/html" in content_type:
+            raise Exception("Blocked or not a direct file")
+
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
 # ------------------ COMMANDS ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Bot is online.\n\n"
-        "Send a direct download link and I will fetch the file and return it."
+        "Universal Downloader Bot is online.\n\n"
+        "Send any direct download link."
     )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Usage:\n"
-        "1. Send a direct http/https download link\n"
-        "2. Bot downloads the file\n"
-        "3. Bot sends it back to you\n\n"
-        "Notes:\n"
-        "- Must be direct file links\n"
-        "- Some cloud links may not work"
+        "Supported:\n"
+        "- Direct file links\n"
+        "- Most CDN links\n\n"
+        "May NOT work:\n"
+        "- Google Drive preview\n"
+        "- Mega links\n"
+        "- Strong anti-bot sites\n"
     )
 
-# ------------------ DOWNLOAD HANDLER ------------------
+# ------------------ MAIN HANDLER ------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = update.message.text
 
-        if not text or not text.startswith("http"):
-            await update.message.reply_text("Send a valid direct download link.")
+        if not text or not is_url(text):
+            await update.message.reply_text("Send a valid URL.")
             return
 
-        logger.info(f"Downloading: {text}")
         await update.message.reply_text("Downloading...")
 
         file_id = str(uuid.uuid4())
         file_path = f"/tmp/{file_id}"
 
-        with requests.get(text, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+        try:
+            download_file(text, file_path)
+        except Exception as e:
+            logger.warning(f"Direct download failed: {e}")
+            await update.message.reply_text("Trying alternative method...")
+
+            # fallback: simple retry with stronger headers
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                "Referer": text
+            }
+
+            with requests.get(text, stream=True, headers=headers, timeout=60) as r:
+                r.raise_for_status()
+                with open(file_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
 
         await update.message.reply_text("Uploading...")
 
@@ -72,24 +104,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         os.remove(file_path)
 
-        logger.info("Done")
+        await update.message.reply_text("Done.")
 
     except Exception as e:
         logger.exception(e)
-        await update.message.reply_text("Failed to download file.")
+        await update.message.reply_text("Failed to download this link.")
 
 # ------------------ MAIN ------------------
 def main():
-    logger.info("Starting bot...")
-
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
